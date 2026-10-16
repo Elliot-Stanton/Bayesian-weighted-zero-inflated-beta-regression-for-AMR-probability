@@ -1,0 +1,368 @@
+---
+title: "Example code for modelling approach"
+output: html_document
+date: "2026-07-16"
+---
+### data/package read in
+```{r}
+set.seed(1)
+
+library(tidyverse)
+library(lubridate)
+library(naniar)
+library(brms)
+library(tidybayes)
+library(viridis)
+library(cowplot)
+
+# Data for poisson model 
+poisson_model_data <- readRDS("data_for_poisson.rds")
+# Example Poisson model
+pois_mod <- readRDS('pois_mod.Rds')
+# Data for weighted zero inflated beta regression
+zi_model_data <- read_rds(file = "zi_model_data.Rds")
+# Example weighted zero inflated beta regression
+dummy_zi_beta_model <- readRDS("zi_beta_model.RDS")
+
+```
+
+### Functions
+```{r}
+# plotting function
+theme_arwain <- function () { 
+  theme(
+    panel.background  = element_rect(fill="transparent", colour=NA),
+    plot.background = element_rect(fill="transparent", colour=NA), 
+    legend.background = element_rect(fill="transparent", colour=NA),
+    legend.key = element_rect(fill="transparent", colour=NA),
+    panel.grid.minor = element_line(colour="#dedede", size=0.5),
+    panel.grid.major = element_line(colour="#dedede", size=0.5),
+    panel.border = element_rect(colour = NA, fill = "transparent"),
+    strip.text.x = element_text(),
+    strip.text.y = element_text(),
+    strip.background = element_rect(colour=NA, fill="transparent"),
+    panel.spacing.x = unit(2, "lines"),
+    text=element_text(family="Times", size = 14),
+    plot.title=element_text(size=14),
+  )
+}
+
+# get summary for poisson model posterior draws
+compute_summary <- function(x) {
+  c(mean = mean(x),
+    lower = quantile(x, 0.025),
+    upper = quantile(x, 0.975),
+    se_res = sd(x)/sqrt(length(x))) # sample level se of posteriors
+}
+```
+
+
+### poisson priors from Vass et al. 2026
+```{R}
+custom_priors_highvar <- c(
+  set_prior('normal(0, 5)', class = 'b', nlpar = 'interaction'), 
+  set_prior('normal(0, 5)', class = 'b', nlpar = 'main'),
+  set_prior("normal(10, 1)", class = "sd", nlpar = "interaction"),
+  set_prior("normal(10, 1)", class = "sd", nlpar = "main")
+)
+```
+
+### run poisson model - 
+### this is modified from Vass et al. 2026 to incorporate right censored counts 
+### (e.g. >1 or >100).
+```{R}
+### approx 15min runtime, AMD Ryzen 9 7950X 4.5Ghz, 16 core cpu, 32GB RAM
+pois_mod <- brm(bf(
+    Count | cens(censor) ~ main + am * log_inv_logit(interaction), 
+    main ~ offset(log_dilution) + (1|sample_id), 
+    interaction ~ (1|sample_id),
+    nl = TRUE
+  ),
+  data = poisson_model_data, 
+  family = poisson(link = "log"), 
+  prior = custom_priors_highvar,
+  # half n. draws within example
+  warmup = 4000, iter = 8000, chains = 4, cores = 4,
+  silent = FALSE)
+
+
+summary(pois_mod)
+
+
+```
+
+### Estimate likelihood of AMR in AMR -ve samples from Poisson draws. 
+```{R}
+# data used in poisson model
+dummy_data <- pois_mod$data
+dummy_data$sample_id <- factor(dummy_data$sample_id,
+                                       levels = levels(pois_mod$data$sample_id)) 
+
+# get sample level posterior draws for estimated AMR prop.
+dummy_propres <- as_tibble(fitted(pois_mod,
+                                 re_formula = NULL,
+                                 summary = F,
+                                 nlpar = "interaction")) 
+
+# back transform logit scaled proportions
+dummy_propres_trans <- as_tibble(inv_logit_scaled(dummy_propres))
+
+# posterior means, CIs and SE's for each sample
+dummy_propres_summary <- apply(dummy_propres_trans, 2, compute_summary)
+
+# transpose to long format
+dummy_propres_summary_df <- as.data.frame(t(dummy_propres_summary))
+
+# set threshold for draws
+# numerically lower threshold = more res bacteria required for a draw to be AMR 
+# +ve. 
+dummy_propres_likelihood_1000 <- dummy_propres_trans %>%
+  mutate(across(everything(), ~ ifelse(. > 0.001, 1, 0))) 
+
+# get posterior means (proportion of draws > threshold)
+dummy_propres_likelihood_1000 <-  colMeans(dummy_propres_likelihood_1000)
+dummy_propres_likelihood_1000_df <- as.data.frame(dummy_propres_likelihood_1000)
+
+# attach sample identifiers
+dummy_interaction_with_counts_1000 <- cbind(dummy_data, 
+                                            dummy_propres_summary_df, 
+                                            dummy_propres_likelihood_1000_df)
+
+# Poisson model estimates only used for AMR negative samples (where count for am
+# == 1 is 0). 
+amnegative <- dummy_interaction_with_counts_1000 %>%
+  filter(am == 1 & Count == 0) %>%
+  pull(sample_id)
+
+am_negative_dummy_interaction_with_counts_1000 <- dummy_interaction_with_counts_1000 %>%
+  filter(sample_id %in% amnegative) %>%
+  filter(am == 0 & Count > 0)
+
+# calculate weights - down weight uncertain samples. 
+
+# get max weight for normalizing
+max_weight_1000 <- max(
+  am_negative_dummy_interaction_with_counts_1000 %>%
+    filter(am == 0) %>%
+    mutate(weight = log(1/se_res)) %>%
+    pull(weight))
+
+# log transform inverse variance weights in weiht_adj 
+am_negative_dummy_interaction_with_counts_weight_1000 <- am_negative_dummy_interaction_with_counts_1000 %>%
+  filter(am == 0) %>%
+  mutate(weight_adj = log(1/se_res)/max_weight_1000,
+         weight = 1/se_res)
+
+### data frame of amr -ve samples with weights and 
+dummy_likelihoods_and_weights <- 
+  am_negative_dummy_interaction_with_counts_weight_1000 %>%
+  rename("amr_likelihood" = "dummy_propres_likelihood_1000") %>%
+  select(sample_id, amr_likelihood, weight_adj)
+```
+
+### Join estimated AMR likelihood to sample metadata
+```{R}
+
+# join amr negative likelihoods and weights
+zi_model_data <- zi_model_data %>% 
+  left_join(dummy_likelihoods_and_weights)
+
+zi_model_data <- zi_model_data %>%
+  # assign likelihood of 1 to AMR +ve samples
+  mutate(amr_likelihood = ifelse(is.na(amr_likelihood), 1, 
+                                 amr_likelihood),
+         # assign weight of 1 to AMR +ve samples
+         weight_adj = ifelse(is.na(weight_adj), 1, 
+                                 weight_adj),
+         # inverse likelihoods for ZI modelling
+         zi_amr_likelihood = ifelse(amr_likelihood == 1, 0, 
+                                 1 - amr_likelihood))
+
+```
+
+### priors for beta regression
+```{R}
+# hosrshoes priors on fixed/population effects. 
+zi_priors <- c(set_prior("student_t(3, 0, 2.5)", class = "Intercept"),
+                   set_prior("horseshoe(3)", class = "b"),
+                   set_prior("logistic(0,1)", class = "Intercept", dpar ="zi"),
+                   set_prior("horseshoe(3)", class = "b", dpar = "zi"))
+```
+
+### model formula:
+
+```{R}
+# mirrored formulae for mean and zi terms
+zi_beta_formula <- bf(
+  zi_amr_likelihood | weights(weight_adj) ~ 
+    1 + species + age_group + location_group +
+    t2(CLIMATE_mean_temp_7, CLIMATE_mean_humid_7_scaled, bs = "tp", by = location_group) +
+    s(day_of_study, bs = "tp", by = species) +
+    (1|visit_id) + (1|vet_id) + (1|farm),
+  
+  zi ~ 1 + species + age_group + location_group +
+    t2(CLIMATE_mean_temp_7, CLIMATE_mean_humid_7_scaled, bs = "tp", by = location_group) +
+    s(day_of_study, bs = "tp", by = species) +
+    (1|visit_id) + (1|vet_id) + (1|farm)
+)
+
+```
+
+```{R}
+# format model data for weighted ZI beta regression
+zi_model_data <- zi_model_data %>%
+  distinct(sample_id, .keep_all = TRUE) %>%
+  mutate(
+    day_of_study = as.numeric(day_of_study),
+    visit_id = as.factor(visit_id),
+    vet_id = as.factor(vet_id),
+    age_group = as.factor(age_group),
+    location_group = as.factor(location_group),
+    species = as.factor(species),
+    farm = as.factor(farm)
+  ) %>%
+  select(sample_id, amr_binary, zi_amr_likelihood, weight_adj, am_free_numeric,
+         farm, vet_id, visit_id, species, age_group, location_group, day_of_study,
+         CLIMATE_mean_temp_7, CLIMATE_mean_humid_7_scaled)  %>%
+  drop_na() %>%
+  filter(am_free_numeric > 0) %>%
+  mutate(day_of_study = scale(day_of_study))
+
+# zi beta regression
+dummy_zi_beta_model <- brm(zi_beta_formula,
+                  data = zi_model_data,
+                  family = zero_inflated_beta(),
+                  prior = zi_priors,
+                  backend = "cmdstanr",
+                  adapt_delta = 0.99,
+                  warmup = 1000, iter = 2000, chains = 4, cores=4) 
+
+
+summary(dummy_zi_beta_model)
+```
+
+### demonstration plot - visualising modelled splines across the range of 
+### temperatures observed.
+```{R}
+
+# create dummy data set with range of temperatures between min and max observed.
+# indoor samples.
+dummy_temperature <- expand.grid(
+  species = NA,
+  age_group = NA,
+  location_group = "indoor",
+  CLIMATE_mean_humid_7_scaled = mean(zi_model_data$CLIMATE_mean_humid_7_scaled, na.rm = TRUE),
+  CLIMATE_mean_temp_7 = seq(
+    min(zi_model_data$CLIMATE_mean_temp_7, na.rm = TRUE),
+    max(zi_model_data$CLIMATE_mean_temp_7, na.rm = TRUE),
+    length.out = 100
+  ),
+  day_of_study = mean(zi_model_data$day_of_study, na.rm = TRUE)
+)
+
+# posterior draw df
+temp <- as_tibble(fitted(
+  dummy_zi_beta_model,
+  newdata = dummy_temperature,
+  re_formula = NA,
+  summary = FALSE
+))
+
+### randomly select 800 spline estimates
+estimates_splines_800 <- temp[sample(1:nrow(temp), 800), ]
+
+# attach and backtransform temperatures
+estimates_splines_800_tidy <- as_tibble(t(estimates_splines_800)) %>%
+  mutate(change_var = dummy_temperature$CLIMATE_mean_temp_7) %>%
+  gather(key = 'spline', value = 'estimate', -change_var) %>%
+  mutate(temperature = change_var * 
+           attr(zi_model_data$CLIMATE_mean_temp_7, "scaled:scale") + 
+           attr(zi_model_data$CLIMATE_mean_temp_7, "scaled:center"))
+
+
+# get posterior summaries for each temperature
+estimates_summary <- as_tibble(fitted(dummy_zi_beta_model,
+                                      newdata = dummy_temperature,
+                                      re_formula = NA,
+                                      summary = T))
+
+
+results <- cbind(estimates_summary, dummy_temperature)%>%
+  distinct() 
+
+# attach and backtransform temperatures
+results <- results %>%
+  rename('change_var' = CLIMATE_mean_temp_7) %>%
+  mutate(model = "ZI") %>%
+  mutate(temperature = change_var * 
+           attr(zi_model_data$CLIMATE_mean_temp_7, "scaled:scale") + 
+           attr(zi_model_data$CLIMATE_mean_temp_7, "scaled:center"))
+
+
+# build histogram showing observations and binary amr status
+indoor_temp_hist <- zi_model_data %>%
+  filter(location_group == "indoor") %>%
+  ggplot(aes(x = CLIMATE_mean_temp_7 * 
+               attr(CLIMATE_mean_temp_7, "scaled:scale") +
+               attr(CLIMATE_mean_temp_7, "scaled:center"),
+             fill = as.factor(amr_binary))) +
+  geom_histogram(position = "stack") +
+  scale_fill_manual(values = c("0" = viridis(2)[1],   
+                               "1" = viridis(2)[2])) + 
+  theme_arwain() +
+  xlab("Temperature (°C)")  +
+  ylab("Court") +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.x = element_blank(),
+        legend.position = "none")
+
+# plot splines
+indoor_amox_temp <- estimates_splines_800_tidy %>%
+  ggplot() +
+  geom_line(aes(x = temperature, y = 1-estimate, group = spline), 
+            colour = '#C98BE0', alpha = 0.2) +
+  geom_line(data = results, aes(x = temperature, y = 1-Estimate), 
+            colour = 'black', linewidth = 1.5) +
+  theme_arwain() +
+  theme(panel.grid = element_line(color = "#c9c9c9",
+                                  linewidth = 0.5)) +
+  xlab("Temperature (°C)") +
+  ylab('Likelihood of resistance') +
+  ylim(0, 1) 
+
+# join plots
+indoor_amox_temp <- plot_grid(indoor_temp_hist, indoor_amox_temp,
+                        ncol = 1, rel_heights = c(0.25, 1))  
+
+indoor_amox_temp
+
+# get min and max temperatures
+min_row <- dummy_temperature[which.min(dummy_temperature$CLIMATE_mean_temp_7), ]
+max_row <- dummy_temperature[which.max(dummy_temperature$CLIMATE_mean_temp_7), ]
+
+minmax_temp_rows <- rbind(min_row, max_row)
+
+# fit model on min and max temperatures
+minmax_estimates <- as_tibble(fitted(dummy_zi_beta_model,
+                                     newdata = minmax_temp_rows,
+                                     re_formula = NA,
+                                     summary = F))
+
+# quantify fold change in posterior likelihoods/CIs
+indoor_amox_temp_minmax <- minmax_estimates %>%
+  mutate(min_temp = 1-V1,
+         max_temp = 1-V2) %>%
+  mutate(foldchange = max_temp/min_temp) %>%
+  summarise(median_foldchange = median(foldchange),
+            lwr2_5 = quantile(foldchange, 0.025),
+            upr97_5 = quantile(foldchange, 0.975),
+            lwr5 = quantile(foldchange, 0.05),
+            upr95 = quantile(foldchange, 0.95),
+            lwr25 = quantile(foldchange, 0.25),
+            upr75 = quantile(foldchange, 0.75)) %>%
+  mutate(location = "indoor")
+
+indoor_amox_temp_minmax
+
+```
