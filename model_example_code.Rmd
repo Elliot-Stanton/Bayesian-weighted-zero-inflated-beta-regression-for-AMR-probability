@@ -17,12 +17,9 @@ library(cowplot)
 
 # Data for poisson model 
 poisson_model_data <- readRDS("data_for_poisson.rds")
-# Example Poisson model
-pois_mod <- readRDS('pois_mod.Rds')
 # Data for weighted zero inflated beta regression
 zi_model_data <- read_rds(file = "zi_model_data.Rds")
-# Example weighted zero inflated beta regression
-dummy_zi_beta_model <- readRDS("zi_beta_model.RDS")
+
 
 ```
 
@@ -229,6 +226,7 @@ zi_model_data <- zi_model_data %>%
   mutate(day_of_study = scale(day_of_study))
 
 # zi beta regression
+#approx 10min runtime, AMD Ryzen 9 7950X 4.5Ghz, 16 core cpu, 32GB RAM
 dummy_zi_beta_model <- brm(zi_beta_formula,
                   data = zi_model_data,
                   family = zero_inflated_beta(),
