@@ -13,8 +13,8 @@ unobserved in AMR negative samples. Log transformed inverse variance weighting
 is applied to weight probabilities in AMR negative samples. 
 
 An example application of this modelling approach in which the effect of changing 
-temperature preceding sampling of the probability of observing resistance is 
-included.
+temperature preceding sampling on the probability of observing resistance is 
+investigated has been included. 
 
 ## Contents
 
